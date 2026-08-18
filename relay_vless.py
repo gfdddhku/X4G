@@ -1,10 +1,15 @@
+# relay_vless.py
+# VLESS Relay - بدون import مستقیم از main برای جلوگیری از circular import
+
 import asyncio
 import secrets
 from datetime import datetime
 
 from fastapi import WebSocket, WebSocketDisconnect
-
 from speed_limit import throttle
+
+
+RELAY_BUF = 256 * 1024
 
 
 def get_main():
@@ -12,36 +17,33 @@ def get_main():
     return main
 
 
-RELAY_BUF = 256 * 1024
-
-
 def _ws_client_ip(ws: WebSocket) -> str:
     fwd = ws.headers.get("x-forwarded-for")
     if fwd:
         return fwd.split(",")[0].strip()
 
-    real_ip = ws.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
+    real = ws.headers.get("x-real-ip")
+    if real:
+        return real.strip()
 
-    return ws.client.host if ws.client else "نامشخص"
+    return ws.client.host if ws.client else "unknown"
 
 
 async def parse_vless_header(chunk: bytes):
     if len(chunk) < 24:
-        raise ValueError("chunk too small")
+        raise ValueError("invalid header")
 
     pos = 1
     pos += 16
 
-    addon_len = chunk[pos]
-    pos += 1 + addon_len
+    addon = chunk[pos]
+    pos += 1 + addon
 
     command = chunk[pos]
     pos += 1
 
     port = int.from_bytes(
-        chunk[pos:pos+2],
+        chunk[pos:pos + 2],
         "big"
     )
     pos += 2
@@ -51,43 +53,31 @@ async def parse_vless_header(chunk: bytes):
 
     if addr_type == 1:
         address = ".".join(
-            str(x) for x in chunk[pos:pos+4]
+            str(x) for x in chunk[pos:pos + 4]
         )
         pos += 4
 
     elif addr_type == 2:
-        length = chunk[pos]
+        ln = chunk[pos]
         pos += 1
-
-        address = chunk[
-            pos:pos+length
-        ].decode(
+        address = chunk[pos:pos + ln].decode(
             "utf-8",
             errors="ignore"
         )
-
-        pos += length
+        pos += ln
 
     elif addr_type == 3:
-        raw = chunk[pos:pos+16]
+        raw = chunk[pos:pos + 16]
         pos += 16
-
         address = ":".join(
             f"{raw[i]:02x}{raw[i+1]:02x}"
             for i in range(0,16,2)
         )
 
     else:
-        raise ValueError(
-            "unknown addr"
-        )
+        raise ValueError("unknown address")
 
-    return (
-        command,
-        address,
-        port,
-        chunk[pos:]
-    )
+    return command, address, port, chunk[pos:]
 
 
 async def check_and_use(uid: str, n: int):
@@ -103,9 +93,7 @@ async def check_and_use(uid: str, n: int):
             return False
 
         link["used_bytes"] += n
-
         main.stats["total_bytes"] += n
-
         main.hourly_traffic[
             main.now_ir().strftime("%H:00")
         ] += n
@@ -140,7 +128,6 @@ async def relay_ws_to_tcp(
                 uid,
                 len(data)
             ):
-                await ws.close()
                 break
 
             await throttle(
@@ -149,7 +136,6 @@ async def relay_ws_to_tcp(
             )
 
             main.stats["total_requests"] += 1
-
             main.connections[conn_id]["bytes"] += len(data)
 
             writer.write(data)
@@ -168,14 +154,11 @@ async def relay_tcp_to_ws(
     uid
 ):
     main = get_main()
-
     first = True
 
     try:
         while True:
-            data = await reader.read(
-                RELAY_BUF
-            )
+            data = await reader.read(RELAY_BUF)
 
             if not data:
                 break
@@ -184,7 +167,6 @@ async def relay_tcp_to_ws(
                 uid,
                 len(data)
             ):
-                await ws.close()
                 break
 
             await throttle(
@@ -194,22 +176,15 @@ async def relay_tcp_to_ws(
 
             main.connections[conn_id]["bytes"] += len(data)
 
-            payload = (
-                b"\x00\x00" + data
-                if first
-                else data
-            )
+            if first:
+                data = b"\x00\x00" + data
+                first = False
 
-            first = False
-
-            await ws.send_bytes(payload)
+            await ws.send_bytes(data)
 
     except Exception:
         pass
-        async def websocket_tunnel(
-    ws: WebSocket,
-    uuid: str
-):
+        async def websocket_tunnel(ws: WebSocket, uuid: str):
     main = get_main()
 
     await ws.accept()
@@ -220,34 +195,24 @@ async def relay_tcp_to_ws(
     if not main.is_link_allowed(link):
         await ws.close(
             code=1008,
-            reason="not authorized"
+            reason="not allowed"
         )
         return
 
-
     ip = _ws_client_ip(ws)
-
 
     if not main.is_ip_allowed(
         link,
         uuid,
         ip
     ):
-        main.log_activity(
-            "connection",
-            f"اتصال {ip} رد شد",
-            "warn"
-        )
-
         await ws.close(
             code=1008,
             reason="ip limit"
         )
         return
 
-
     conn_id = secrets.token_urlsafe(6)
-
 
     main.connections[conn_id] = {
         "uuid": uuid,
@@ -257,54 +222,41 @@ async def relay_tcp_to_ws(
         "bytes": 0,
     }
 
-
     writer = None
 
-
     try:
-        first_msg = await asyncio.wait_for(
+        first = await asyncio.wait_for(
             ws.receive(),
             timeout=15
         )
 
-
-        if first_msg["type"] == "websocket.disconnect":
+        if first["type"] == "websocket.disconnect":
             return
 
-
-        first_chunk = (
-            first_msg.get("bytes")
-            or (first_msg.get("text") or "").encode()
+        chunk = (
+            first.get("bytes")
+            or (first.get("text") or "").encode()
         )
 
-
-        if not first_chunk:
+        if not chunk:
             return
-
 
         command, address, port, payload = (
-            await parse_vless_header(
-                first_chunk
-            )
+            await parse_vless_header(chunk)
         )
-
 
         if not await check_and_use(
             uuid,
-            len(first_chunk)
+            len(chunk)
         ):
             await ws.close(
-                code=1008
+                code=1008,
+                reason="quota"
             )
             return
 
-
         main.stats["total_requests"] += 1
-
-        main.connections[conn_id]["bytes"] += (
-            len(first_chunk)
-        )
-
+        main.connections[conn_id]["bytes"] += len(chunk)
 
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(
@@ -314,26 +266,21 @@ async def relay_tcp_to_ws(
             timeout=10
         )
 
-
         sock = writer.transport.get_extra_info(
             "socket"
         )
 
-
         if sock:
             import socket
-
             sock.setsockopt(
                 socket.IPPROTO_TCP,
                 socket.TCP_NODELAY,
                 1
             )
 
-
         if payload:
             writer.write(payload)
             await writer.drain()
-
 
         tasks = {
             asyncio.create_task(
@@ -351,37 +298,28 @@ async def relay_tcp_to_ws(
                     conn_id,
                     uuid
                 )
-            )
+            ),
         }
-
 
         done, pending = await asyncio.wait(
             tasks,
             return_when=asyncio.FIRST_COMPLETED
         )
 
-
         for task in pending:
             task.cancel()
-
-
-        asyncio.create_task(
-            main.save_state()
-        )
-
 
     except WebSocketDisconnect:
         pass
 
-
-    except Exception as exc:
+    except Exception as e:
         main.stats["total_errors"] += 1
-
-        main.error_logs.append({
-            "error": str(exc),
-            "time": datetime.now().isoformat()
-        })
-
+        main.error_logs.append(
+            {
+                "error": str(e),
+                "time": datetime.now().isoformat()
+            }
+        )
 
     finally:
         if writer:
@@ -391,8 +329,7 @@ async def relay_tcp_to_ws(
             except Exception:
                 pass
 
-
         main.connections.pop(
             conn_id,
             None
-            )
+                )
