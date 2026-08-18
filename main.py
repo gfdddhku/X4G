@@ -1003,11 +1003,7 @@ async def delete_link(uid: str, _=Depends(require_auth)):
 from relay_vless import (
     RELAY_BUF,
     parse_vless_header,
-    check_and_use,
-    relay_ws_to_tcp,
-    relay_tcp_to_ws,
-    websocket_tunnel,
-)
+from relay_vless import websocket_tunnel
 
 app.add_api_websocket_route("/ws/{uuid}", websocket_tunnel)
 
